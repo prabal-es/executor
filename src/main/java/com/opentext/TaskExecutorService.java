@@ -3,15 +3,9 @@ package com.opentext;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
-import java.util.concurrent.Callable;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Future;
+import java.util.concurrent.*;
 import java.util.concurrent.locks.ReentrantLock;
-import java.util.concurrent.Semaphore;
-import java.util.concurrent.TimeUnit;
+import java.util.function.Supplier;
 
 import com.opentext.Main.TaskExecutor;
 import com.opentext.Main.Task;
@@ -27,44 +21,46 @@ public class TaskExecutorService implements TaskExecutor {
 
     public TaskExecutorService(int maxConcurrency) {
         this.executorService = Executors.newFixedThreadPool(maxConcurrency);
+        this.concurrencySemaphore = new Semaphore(maxConcurrency, true);
         //new ThreadPoolExecutor(nThreads, nThreads, 0L, TimeUnit.MILLISECONDS, new LinkedBlockingQueue<Runnable>());
-        this.concurrencySemaphore = new Semaphore(maxConcurrency);
     }
 
     @Override
     public <T> Future<T> submitTask(Task<T> task) {
         // Create a task wrapper that ensures ordering and group locking
-        Callable<T> wrappedTask = () -> {
-            // Acquire the concurrency limit
-            concurrencySemaphore.acquire();
-
+        Supplier<T> wrappedTask = () -> {
+            try {
+                // Acquire the concurrency limit
+                concurrencySemaphore.acquire();
+            } catch (InterruptedException e) {
+                throw new RuntimeException(e);
+            }
             // Lock the task group to ensure no concurrent execution of tasks within the same group
-            ReentrantLock groupLock = groupLocks.computeIfAbsent(task.taskGroup().groupUUID(), k -> new ReentrantLock());
+            ReentrantLock groupLock = groupLocks.computeIfAbsent(task.taskGroup().groupUUID(), k -> new ReentrantLock(true));
             groupLock.lock();
-
             try {
                 // Execute the actual task
                 return task.taskAction().call();
+            } catch (Exception e) {
+                throw new RuntimeException(e);
             } finally {
                 // Release the group lock and concurrency semaphore
                 groupLock.unlock();
                 concurrencySemaphore.release();
-
                 // Clean up the group lock if no other tasks are waiting
                 if (!groupLock.hasQueuedThreads()) {
                     groupLocks.remove(task.taskGroup().groupUUID(), groupLock);
                 }
             }
         };
-
-        // Return a Future that is submitted to the executor service
-        return executorService.submit(wrappedTask);
+        // Return a CompletableFuture that is submitted to the executor service
+        return CompletableFuture.supplyAsync(wrappedTask, executorService);
     }
 
     public void shutdown() {
         executorService.shutdown();
         try {
-            if (!executorService.awaitTermination(18, TimeUnit.SECONDS)) {
+            if (!executorService.awaitTermination(60, TimeUnit.SECONDS)) {
                 executorService.shutdownNow();
             }
         } catch (InterruptedException e) {
@@ -73,8 +69,8 @@ public class TaskExecutorService implements TaskExecutor {
         }
     }
 
-    public static void main(String[] args) throws ExecutionException, InterruptedException {
-        TaskExecutorService taskExecutorService = new TaskExecutorService(3);
+    public static void main(String[] args) {
+        TaskExecutorService taskExecutorService = new TaskExecutorService(5);
 
         TaskGroup group1 = new TaskGroup(UUID.randomUUID());
         TaskGroup group2 = new TaskGroup(UUID.randomUUID());
@@ -83,7 +79,7 @@ public class TaskExecutorService implements TaskExecutor {
         taskFutures.add(taskExecutorService.submitTask(new Task<>(
                 UUID.randomUUID(), group1, TaskType.WRITE, () -> {
                 System.out.println("Executing Task 1");
-                Thread.sleep(3000);
+                TimeUnit.SECONDS.sleep(4);
                 return 1;
             }))
         );
@@ -91,7 +87,7 @@ public class TaskExecutorService implements TaskExecutor {
         taskFutures.add(taskExecutorService.submitTask(new Task<>(
                 UUID.randomUUID(), group1, TaskType.READ, () -> {
                 System.out.println("Executing Task 2");
-                Thread.sleep(2000);
+                TimeUnit.SECONDS.sleep(3);
                 return 2;
             }))
         );
@@ -99,7 +95,7 @@ public class TaskExecutorService implements TaskExecutor {
         taskFutures.add(taskExecutorService.submitTask(new Task<>(
                 UUID.randomUUID(), group2, TaskType.WRITE, () -> {
                 System.out.println("Executing Task 3");
-                Thread.sleep(3000);
+                TimeUnit.SECONDS.sleep(2);
                 return 3;
             }))
         );
@@ -107,15 +103,21 @@ public class TaskExecutorService implements TaskExecutor {
         taskFutures.add(taskExecutorService.submitTask(new Task<>(
                 UUID.randomUUID(), group2, TaskType.WRITE, () -> {
                 System.out.println("Executing Task 4");
-                Thread.sleep(2000);
+                TimeUnit.SECONDS.sleep(1);
                 return 4;
             }))
         );
 
-        for(int i = 0; i < taskFutures.size(); i++){
-            System.out.println("Task "+(i+1)+" result: " + taskFutures.get(i).get());
+        for(Future<Integer> task : taskFutures){
+            if(task instanceof CompletableFuture){
+                ((CompletableFuture<Integer>)task).thenAccept(taskExecutorService::printResult);
+            }
         }
 
         taskExecutorService.shutdown();
+    }
+
+    private void printResult(int result){
+        System.out.println("Task result: " + result);
     }
 }
